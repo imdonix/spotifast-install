@@ -1,8 +1,27 @@
-# Spotifast Linux Installer
+<p align="center">
+  <img src="https://raw.githubusercontent.com/crmne/spotifast/main/docs/assets/images/logo.svg" alt="Spotifast logo" width="96">
+</p>
 
-> **What is Spotifast?** [Spotifast](https://spotifast.rocks/) is a lightweight, native Spotify client for Linux, macOS, and Windows, written in Rust. Playback requires **Spotify Premium**.
+<h1 align="center">Spotifast Linux Installer</h1>
+
+> **What is Spotifast?**
+> [Spotifast](https://spotifast.rocks/) is a lightweight, native Spotify client for Linux, macOS, and Windows, written in Rust. It starts in well under a second, typically uses 100–250 MB of RAM, and supports Spotify Connect, local files, MPRIS, a Winamp-style mini player, and MilkDrop. Playback requires **Spotify Premium**.
 >
-> This repository is an unofficial, per-user Linux installer for the official Spotifast AppImage. It is not the Spotifast project.
+> Spotifast is an independent project by Carmine Paolino: [spotifast.rocks](https://spotifast.rocks/) · [GitHub](https://github.com/crmne/spotifast). It is not affiliated with or endorsed by Spotify AB.
+>
+> **This repository is not Spotifast.** It is an unofficial installer that makes the official Linux build feel like a normal desktop app.
+
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-2b2b2b?logo=linux&logoColor=white)](TECHNICAL.md#requirements)
+[![Installer: Bash](https://img.shields.io/badge/installer-Bash-4eaa25?logo=gnubash&logoColor=white)](#install)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+<p align="center">
+  <a href="https://spotifast.rocks/">
+    <img src="https://raw.githubusercontent.com/crmne/spotifast/main/docs/screenshot.png" alt="Spotifast screenshot" width="760">
+  </a>
+</p>
+
+---
 
 ## Install
 

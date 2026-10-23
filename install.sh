@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 #
-# Spotifast installer for Linux (Ubuntu-based distributions).
+# Spotifast installer for Linux and macOS.
 #
-# Installs the official Spotifast AppImage for the current user, adds a desktop
-# entry and icon so it appears in the application menu, and installs an updater
-# that checks GitHub releases in the background when Spotifast starts.
+# On Linux this installs the official AppImage for the current user, adds a
+# desktop entry and icon, and installs an updater that checks GitHub releases
+# in the background when Spotifast starts.
+#
+# On macOS it hands off to lib/install-macos.sh, which installs the official
+# universal app bundle into ~/Applications.
 #
 # This is an unofficial community installer. Spotifast itself is developed by
 # Carmine Paolino: https://github.com/crmne/spotifast
@@ -67,22 +70,25 @@ die()  { printf '%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-${C_BOLD}Spotifast installer for Linux${C_RESET}
+${C_BOLD}Spotifast installer for Linux and macOS${C_RESET}
 
 Usage:
   install.sh                 install or update to the latest release
   install.sh --version X.Y.Z install a specific release
-  install.sh --force         continue even if the glibc check fails
+  install.sh --force         continue even if the glibc check fails (Linux)
   install.sh --uninstall     remove Spotifast, keep settings and sign-ins
   install.sh --uninstall --purge
                              remove Spotifast and all of its data
   install.sh --help          show this help
 
+On Windows, run install.ps1 in PowerShell instead.
+
 Environment:
-  SPOTIFAST_INSTALL_DIR      install directory (default: ~/.local/opt/spotifast)
-  XDG_BIN_HOME               command directory (default: ~/.local/bin)
-  XDG_DATA_HOME              desktop/icon directory (default: ~/.local/share)
-  XDG_STATE_HOME             installer state directory (default: ~/.local/state)
+  SPOTIFAST_INSTALL_DIR      Linux install directory (default: ~/.local/opt/spotifast)
+  SPOTIFAST_APP_DIR          macOS Applications directory (default: ~/Applications)
+  XDG_BIN_HOME               Linux command directory (default: ~/.local/bin)
+  XDG_DATA_HOME              Linux desktop/icon directory (default: ~/.local/share)
+  XDG_STATE_HOME             Linux installer state directory (default: ~/.local/state)
   SPOTIFAST_REPO_RAW         raw base for lib/ helpers (forks and testing)
 EOF
 }
@@ -93,6 +99,50 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+
+# The launcher, updater, and fallback icon live in lib/ so they can be reviewed
+# and edited on their own. When this script is piped from GitHub, they are
+# downloaded from the same branch as this installer.
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
+RAW_BASE="${SPOTIFAST_REPO_RAW:-https://raw.githubusercontent.com/imdonix/spotifast-install/main}"
+
+helper_file() {
+  local name="$1"
+  local dest
+
+  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/lib/$name" ]; then
+    printf '%s\n' "$SCRIPT_DIR/lib/$name"
+    return 0
+  fi
+
+  if [ -z "$WORKDIR" ]; then
+    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/spotifast-install.XXXXXXXX")" || return 1
+  fi
+  dest="$WORKDIR/helper-$name"
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
+    -o "$dest" "$RAW_BASE/lib/$name" || return 1
+  printf '%s\n' "$dest"
+}
+
+# macOS has its own installer because it uses a signed .app bundle and DMG
+# instead of an AppImage. The Windows installer is separate (install.ps1).
+case "$(uname -s)" in
+  Linux)
+    ;;
+  Darwin)
+    macos_installer="$(helper_file install-macos.sh)" ||
+      die "Could not download the macOS installer. Check your connection and try again."
+    /bin/bash "$macos_installer" "$@"
+    status=$?
+    exit "$status"
+    ;;
+  *)
+    die "Unsupported operating system: $(uname -s). On Windows, run install.ps1 in PowerShell."
+    ;;
+esac
 
 parse_args() {
   while [ $# -gt 0 ]; do
@@ -143,10 +193,6 @@ version_ge() {
 
 check_platform() {
   [ -n "${HOME:-}" ] || die "HOME is not set"
-
-  if [ "$(uname -s)" != "Linux" ]; then
-    die "This installer only supports Linux."
-  fi
 
   case "$(uname -m)" in
     x86_64|amd64)
@@ -216,33 +262,6 @@ download() {
 
 download_quiet() {
   curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "$2" "$1"
-}
-
-# The launcher, updater, and fallback icon live in lib/ so they can be reviewed
-# and edited on their own. When this script is piped from GitHub, they are
-# downloaded from the same branch as this installer.
-SCRIPT_DIR=""
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-fi
-RAW_BASE="${SPOTIFAST_REPO_RAW:-https://raw.githubusercontent.com/imdonix/spotifast-install/main}"
-
-helper_file() {
-  local name="$1"
-  local dest
-
-  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/lib/$name" ]; then
-    printf '%s\n' "$SCRIPT_DIR/lib/$name"
-    return 0
-  fi
-
-  if [ -z "$WORKDIR" ]; then
-    WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/spotifast-install.XXXXXXXX")" || return 1
-  fi
-  dest="$WORKDIR/helper-$name"
-  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
-    -o "$dest" "$RAW_BASE/lib/$name" || return 1
-  printf '%s\n' "$dest"
 }
 
 verify_signature() {

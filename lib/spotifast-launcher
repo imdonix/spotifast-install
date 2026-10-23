@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Internal Spotifast launcher. The --launch flag is used by the desktop entry:
+# it starts a once-a-day background update check, then starts Spotifast.
+set -u
+
+SOURCE="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f -- "$SOURCE" 2>/dev/null || printf '%s' "$SOURCE")"
+else
+  SELF="$SOURCE"
+fi
+INSTALL_DIR="${SPOTIFAST_INSTALL_DIR:-$(cd -- "$(dirname -- "$SELF")" && pwd -P)}"
+APPIMAGE="$INSTALL_DIR/Spotifast.AppImage"
+RUN_MODE="$(cat "$INSTALL_DIR/run-mode" 2>/dev/null || printf 'direct')"
+
+if [ ! -x "$APPIMAGE" ]; then
+  printf 'Spotifast is not installed correctly: %s is missing or not executable.\n' "$APPIMAGE" >&2
+  printf 'Reinstall it with the Spotifast install script.\n' >&2
+  exit 1
+fi
+
+LAUNCH_CHECK=0
+case "${1:-}" in
+  --launch)
+    LAUNCH_CHECK=1
+    shift
+    ;;
+  ""|--start-hidden)
+    LAUNCH_CHECK=1
+    ;;
+  spotify:*|*open.spotify.com*)
+    LAUNCH_CHECK=1
+    ;;
+esac
+
+if [ "$LAUNCH_CHECK" -eq 1 ] && [ -x "$INSTALL_DIR/spotifast-update" ]; then
+  if command -v setsid >/dev/null 2>&1; then
+    ( setsid "$INSTALL_DIR/spotifast-update" --auto >/dev/null 2>&1 </dev/null & ) || true
+  else
+    ( nohup "$INSTALL_DIR/spotifast-update" --auto >/dev/null 2>&1 </dev/null & ) || true
+  fi
+fi
+
+if [ "$RUN_MODE" = "extract" ]; then
+  exec "$APPIMAGE" --appimage-extract-and-run "$@"
+fi
+exec "$APPIMAGE" "$@"

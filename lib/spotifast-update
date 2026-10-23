@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+# Spotifast updater.
+#
+# Checks the official GitHub releases, verifies the published Ed25519 signature
+# and SHA-256 checksum, and replaces the installed AppImage in place.
+#
+# Usage:
+#   spotifast-update             check and, if needed, update (GUI when possible)
+#   spotifast-update --auto      background check used by the launcher (once a day)
+#   spotifast-update --check     report whether an update is available
+#   spotifast-update --foreground
+#                                check and update in the terminal
+#   spotifast-update --gui       check and update with small zenity dialogs
+#   spotifast-update --version   print the installed version
+#
+set -u
+
+UPSTREAM_REPO="crmne/spotifast"
+CHECK_INTERVAL=86400
+# Pinned Spotifast release signing key. Keep this in sync with install.sh.
+PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA5EyHsVUEhMaHlHvZJ64zP/QxzHrcbMM1M8Yo+CAWtVQ=
+-----END PUBLIC KEY-----'
+
+SOURCE="${BASH_SOURCE[0]:-$0}"
+if command -v readlink >/dev/null 2>&1; then
+  SELF="$(readlink -f -- "$SOURCE" 2>/dev/null || printf '%s' "$SOURCE")"
+else
+  SELF="$SOURCE"
+fi
+INSTALL_DIR="${SPOTIFAST_INSTALL_DIR:-$(cd -- "$(dirname -- "$SELF")" && pwd -P)}"
+APPIMAGE="$INSTALL_DIR/Spotifast.AppImage"
+RUN_MODE_FILE="$INSTALL_DIR/run-mode"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/spotifast-install"
+LOG="$STATE_DIR/update.log"
+STAMP="$STATE_DIR/last-check"
+LOCK="$STATE_DIR/update.lock"
+
+MODE="default"
+CURRENT=""
+LATEST=""
+UPDATE_AVAILABLE=0
+ERROR=""
+
+usage() {
+  cat <<'EOF'
+Spotifast updater
+
+Usage:
+  spotifast-update             check and, if needed, update (GUI when possible)
+  spotifast-update --auto      background check used by the launcher (once a day)
+  spotifast-update --check     report whether an update is available
+  spotifast-update --foreground
+                               check and update in the terminal
+  spotifast-update --gui       check and update with small zenity dialogs
+  spotifast-update --version   print the installed version
+
+The update is downloaded from the official Spotifast GitHub releases, verified
+against the published Ed25519 signature and SHA-256 checksum, and replaced in
+place. Spotifast only picks it up after a restart.
+EOF
+}
+
+log() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+trim_log() {
+  [ -f "$LOG" ] || return 0
+  if [ "$(wc -c < "$LOG" 2>/dev/null || printf 0)" -gt 131072 ]; then
+    if tail -n 300 "$LOG" > "$LOG.tmp" 2>/dev/null; then
+      mv "$LOG.tmp" "$LOG" 2>/dev/null || true
+    else
+      rm -f "$LOG.tmp" 2>/dev/null || true
+    fi
+  fi
+}
+
+notify() {
+  local title="$1"
+  local body="$2"
+  local urgency="${3:-normal}"
+
+  if command -v notify-send >/dev/null 2>&1 &&
+     [ -n "${DBUS_SESSION_BUS_ADDRESS:-}${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    notify-send -a Spotifast -i spotifast -u "$urgency" "$title" "$body" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+gui_available() {
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1
+}
+
+arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x86_64\n' ;;
+    aarch64|arm64) printf 'aarch64\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+latest_version() {
+  local url
+  url="$(curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$UPSTREAM_REPO/releases/latest" 2>/dev/null)" || return 1
+  url="${url%%\?*}"
+  url="${url%/}"
+
+  case "$url" in
+    */tag/v[0-9]*)
+      printf '%s\n' "${url##*/tag/v}"
+      ;;
+    */tag/[0-9]*)
+      printf '%s\n' "${url##*/tag/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+current_version() {
+  [ -x "$APPIMAGE" ] || return 1
+
+  local out
+  out="$("$APPIMAGE" --version 2>/dev/null)" && {
+    printf '%s\n' "$out" | awk 'NR == 1 { print $NF }'
+    return 0
+  }
+  out="$("$APPIMAGE" --appimage-extract-and-run --version 2>/dev/null)" && {
+    printf '%s\n' "$out" | awk 'NR == 1 { print $NF }'
+    return 0
+  }
+  return 1
+}
+
+is_newer() {
+  # Return success when latest ($2) is newer than current ($1).
+  [ -n "$2" ] || return 1
+  [ -z "$1" ] && return 0
+  [ "$1" = "$2" ] && return 1
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$2" ]
+}
+
+download_file() {
+  local url="$1"
+  local dest="$2"
+
+  if [ -t 2 ]; then
+    curl -fL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 \
+      --progress-bar -o "$dest" "$url"
+  else
+    curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 \
+      -o "$dest" "$url"
+  fi
+}
+
+verify_signature() {
+  local dir="$1"
+
+  if ! command -v openssl >/dev/null 2>&1; then
+    log "openssl not found; skipping release signature check (SHA-256 still verified)"
+    return 0
+  fi
+
+  case "$(openssl version 2>/dev/null)" in
+    "OpenSSL 3."*|"OpenSSL 4."*|"OpenSSL 5."*)
+      ;;
+    *)
+      log "OpenSSL 3 or newer not found; skipping release signature check (SHA-256 still verified)"
+      return 0
+      ;;
+  esac
+
+  printf '%s\n' "$PUBKEY_PEM" > "$dir/update-key.pem"
+  openssl pkeyutl -verify -pubin -inkey "$dir/update-key.pem" \
+    -rawin -in "$dir/checksums.txt" -sigfile "$dir/checksums.txt.sig" \
+    >/dev/null 2>&1
+}
+
+restart_hint() {
+  if pgrep -f -- "Spotifast.AppImage" >/dev/null 2>&1; then
+    printf 'Restart Spotifast to use it.'
+  else
+    printf 'It will be used next time you open Spotifast.'
+  fi
+}
+
+refresh_icon() {
+  local dir="$1"
+  local icon_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+
+  [ -d "$icon_dir" ] || return 0
+  mkdir -p "$dir/icon" 2>/dev/null || return 0
+  ( cd "$dir/icon" && "$APPIMAGE" --appimage-extract spotifast.svg >/dev/null 2>&1 ) || return 0
+  [ -s "$dir/icon/squashfs-root/spotifast.svg" ] || return 0
+  cp "$dir/icon/squashfs-root/spotifast.svg" "$icon_dir/.spotifast.svg.new" 2>/dev/null || return 0
+  mv -f "$icon_dir/.spotifast.svg.new" "$icon_dir/spotifast.svg" 2>/dev/null || {
+    rm -f "$icon_dir/.spotifast.svg.new" 2>/dev/null || true
+    return 0
+  }
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+}
+
+check_for_update() {
+  CURRENT="$(current_version 2>/dev/null || printf '')"
+  if ! LATEST="$(latest_version)"; then
+    ERROR="Could not reach GitHub to find the latest release."
+    log "$ERROR"
+    return 1
+  fi
+
+  if is_newer "$CURRENT" "$LATEST"; then
+    UPDATE_AVAILABLE=1
+    log "update available: current=${CURRENT:-unknown} latest=$LATEST"
+  else
+    UPDATE_AVAILABLE=0
+    log "up to date: current=${CURRENT:-unknown} latest=$LATEST"
+  fi
+  return 0
+}
+
+apply_update() {
+  local cpu_arch asset base dir expected actual new_mode new_version out
+
+  [ "$UPDATE_AVAILABLE" -eq 1 ] || return 0
+
+  cpu_arch="$(arch)" || {
+    ERROR="Unsupported CPU architecture: $(uname -m)"
+    log "$ERROR"
+    return 1
+  }
+
+  asset="spotifast-${LATEST}-${cpu_arch}.AppImage"
+  base="https://github.com/$UPSTREAM_REPO/releases/download/v${LATEST}"
+
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || {
+    ERROR="Could not create $INSTALL_DIR"
+    log "$ERROR"
+    return 1
+  }
+  dir="$(mktemp -d "$INSTALL_DIR/.update.XXXXXXXX")" 2>/dev/null || {
+    ERROR="Could not create a temporary directory in $INSTALL_DIR"
+    log "$ERROR"
+    return 1
+  }
+
+  if ! download_file "$base/$asset" "$dir/$asset"; then
+    ERROR="Could not download $asset"
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "$dir/checksums.txt" "$base/checksums.txt"; then
+    ERROR="Could not download checksums.txt"
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 -o "$dir/checksums.txt.sig" "$base/checksums.txt.sig"; then
+    ERROR="Could not download checksums.txt.sig"
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+
+  if ! verify_signature "$dir"; then
+    ERROR="The release signature is not valid."
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+
+  expected="$(awk -v file="$asset" '{ name = $2; sub(/^\*/, "", name); if (name == file) { print $1; exit } }' "$dir/checksums.txt")"
+  actual="$(sha256sum "$dir/$asset" | awk '{print $1}')"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    ERROR="The downloaded AppImage does not match its published checksum."
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+
+  chmod 755 "$dir/$asset"
+  new_mode="direct"
+  if ! out="$("$dir/$asset" --version 2>/dev/null)"; then
+    if out="$("$dir/$asset" --appimage-extract-and-run --version 2>/dev/null)"; then
+      new_mode="extract"
+    else
+      ERROR="The downloaded AppImage cannot run on this system."
+      log "$ERROR"
+      rm -rf "$dir"
+      return 1
+    fi
+  fi
+  new_version="$(printf '%s\n' "$out" | awk 'NR == 1 { print $NF }')"
+  if [ "$new_version" != "$LATEST" ]; then
+    ERROR="The downloaded AppImage reports version '$new_version', expected '$LATEST'."
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+
+  if ! mv -f "$dir/$asset" "$APPIMAGE"; then
+    ERROR="Could not replace $APPIMAGE"
+    log "$ERROR"
+    rm -rf "$dir"
+    return 1
+  fi
+  chmod 755 "$APPIMAGE" 2>/dev/null || true
+  printf '%s\n' "$new_mode" > "$RUN_MODE_FILE" 2>/dev/null || true
+  printf '%s\n' "$LATEST" > "$INSTALL_DIR/VERSION" 2>/dev/null || true
+
+  refresh_icon "$dir"
+  rm -rf "$dir"
+
+  log "updated to $LATEST (run mode: $new_mode)"
+  return 0
+}
+
+run_with_dialog() {
+  local text="$1"
+  shift
+
+  # A static dialog is deliberate: it cannot get out of sync with the work and
+  # it keeps the GUI path independent of stdin. The timeout is only a safety
+  # net; the dialog is dismissed as soon as the command finishes.
+  zenity --info --title="Spotifast" --text="$text" --ok-label="Hide" \
+    --timeout=3600 --width=380 2>/dev/null &
+  local zpid=$!
+  "$@"
+  local rc=$?
+  kill "$zpid" 2>/dev/null || true
+  wait "$zpid" 2>/dev/null || true
+  return "$rc"
+}
+
+print_current() {
+  if [ -n "$CURRENT" ]; then
+    printf 'Spotifast %s is up to date (latest release: %s).\n' "$CURRENT" "$LATEST"
+  else
+    printf 'Spotifast is up to date (latest release: %s).\n' "$LATEST"
+  fi
+}
+
+text_update() {
+  if ! check_for_update; then
+    printf 'Update check failed: %s\nSee %s for details.\n' "$ERROR" "$LOG" >&2
+    return 1
+  fi
+
+  if [ "$UPDATE_AVAILABLE" -ne 1 ]; then
+    print_current
+    return 0
+  fi
+
+  printf 'Updating Spotifast %s -> %s...\n' "${CURRENT:-unknown}" "$LATEST"
+  if apply_update; then
+    printf 'Updated to Spotifast %s. %s\n' "$LATEST" "$(restart_hint)"
+    return 0
+  fi
+
+  printf 'Update failed: %s\nSee %s for details.\n' "$ERROR" "$LOG" >&2
+  return 1
+}
+
+check_only() {
+  if ! check_for_update; then
+    printf 'Update check failed: %s\n' "$ERROR" >&2
+    return 1
+  fi
+
+  if [ "$UPDATE_AVAILABLE" -eq 1 ]; then
+    printf 'Spotifast %s is available (installed: %s).\n' "$LATEST" "${CURRENT:-unknown}"
+    printf 'Run "spotifast-update" to install it.\n'
+  else
+    print_current
+  fi
+}
+
+gui_update() {
+  local message
+
+  if ! gui_available; then
+    text_update
+    return
+  fi
+
+  if ! run_with_dialog "Checking for Spotifast updates..." check_for_update; then
+    message="Could not check for updates.
+
+$ERROR
+
+See $LOG for details."
+    zenity --error --title="Spotifast Update" --width=420 --text="$message" 2>/dev/null || true
+    return 1
+  fi
+
+  if [ "$UPDATE_AVAILABLE" -ne 1 ]; then
+    if [ -n "$CURRENT" ]; then
+      message="Spotifast $CURRENT is up to date."
+    else
+      message="Spotifast is up to date (latest release: $LATEST)."
+    fi
+    zenity --info --title="Spotifast" --width=360 --text="$message" 2>/dev/null || true
+    return 0
+  fi
+
+  message="Spotifast $LATEST is available.
+
+Installed version: ${CURRENT:-unknown}
+
+Download and install it now?"
+  if ! zenity --question --title="Spotifast Update" --width=420 --text="$message" 2>/dev/null; then
+    return 0
+  fi
+
+  if ! run_with_dialog "Downloading Spotifast $LATEST..." apply_update; then
+    message="The update could not be installed.
+
+$ERROR
+
+See $LOG for details."
+    zenity --error --title="Spotifast Update" --width=420 --text="$message" 2>/dev/null || true
+    return 1
+  fi
+
+  message="Spotifast was updated to $LATEST.
+
+$(restart_hint)"
+  zenity --info --title="Spotifast" --width=380 --text="$message" 2>/dev/null || true
+}
+
+auto_update() {
+  local now last
+
+  mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+  if [ -f "$STAMP" ]; then
+    last="$(cat "$STAMP" 2>/dev/null || printf '0')"
+    case "$last" in
+      ''|*[!0-9]*) last=0 ;;
+    esac
+    now="$(date +%s)"
+    if [ $((now - last)) -lt "$CHECK_INTERVAL" ]; then
+      exit 0
+    fi
+  fi
+
+  if check_for_update; then
+    date +%s > "$STAMP" 2>/dev/null || true
+    if [ "$UPDATE_AVAILABLE" -eq 1 ]; then
+      if apply_update; then
+        notify "Spotifast updated" "Version $LATEST is installed. $(restart_hint)"
+      else
+        log "background update failed: $ERROR"
+      fi
+    fi
+  fi
+
+  trim_log
+  exit 0
+}
+
+main() {
+  local rc=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --auto) MODE="auto" ;;
+      --check) MODE="check" ;;
+      --foreground|--now) MODE="foreground" ;;
+      --gui) MODE="gui" ;;
+      --version)
+        current_version || {
+          printf 'Spotifast is not installed in %s.\n' "$INSTALL_DIR" >&2
+          exit 1
+        }
+        exit 0
+        ;;
+      -h|--help) usage; exit 0 ;;
+      *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  case "$MODE" in
+    auto)
+      mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+      if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK" 2>/dev/null || exit 0
+        flock -n 9 || exit 0
+      fi
+      auto_update
+      ;;
+    check)
+      check_only
+      rc=$?
+      ;;
+    gui)
+      gui_update
+      rc=$?
+      ;;
+    foreground)
+      text_update
+      rc=$?
+      ;;
+    default)
+      if gui_available; then
+        gui_update
+      else
+        text_update
+      fi
+      rc=$?
+      ;;
+  esac
+
+  trim_log
+  return "$rc"
+}
+
+main "$@"
